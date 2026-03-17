@@ -14,6 +14,8 @@ import uuid
 from functools import wraps
 from datetime import datetime, timedelta
 import io
+import subprocess
+import tempfile
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))
@@ -36,6 +38,21 @@ try:
 except ImportError as e:
     google_drive_available = False
     print(f"❌ Google Drive import error: {e}")
+
+# Check ffmpeg availability
+def check_ffmpeg():
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+ffmpeg_available = check_ffmpeg()
+if ffmpeg_available:
+    print("✅ ffmpeg is available for video conversion")
+else:
+    print("⚠️  ffmpeg not found - WebM to MP4 conversion will be disabled")
+    print("   Install ffmpeg: apt-get install ffmpeg (Linux) or brew install ffmpeg (Mac)")
 
 def get_admin_hash():
     return hashlib.pbkdf2_hmac('sha256', ADMIN_PASSWORD.encode(), b'admin-salt', 100000).hex()
@@ -60,47 +77,51 @@ def upload_to_google_drive(file_data, filename):
     """Upload file to Google Drive and return shareable link"""
     try:
         print(f"🔍 Starting Google Drive upload for {filename}")
-        
+
         if not GOOGLE_CREDENTIALS_JSON:
             error_msg = "Google Drive credentials not configured"
             log_error(error_msg)
             return None, error_msg
-        
+
         print(f"✅ Credentials found, parsing JSON...")
-        
+
         # Parse credentials JSON
         credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
         print(f"✅ JSON parsed, client_email: {credentials_info.get('client_email', 'NOT FOUND')}")
-        
+
         credentials = service_account.Credentials.from_service_account_info(
             credentials_info,
             scopes=['https://www.googleapis.com/auth/drive.file']
         )
         print(f"✅ Credentials created")
-        
+
         # Build Drive service
         service = build('drive', 'v3', credentials=credentials)
         print(f"✅ Drive service built")
-        
+
         # File metadata
         file_metadata = {
             'name': filename,
             'description': f'Blueshift Support Screen Recording - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
         }
-        
+
         # If folder ID is specified, upload to that folder
         if GOOGLE_DRIVE_FOLDER_ID:
             file_metadata['parents'] = [GOOGLE_DRIVE_FOLDER_ID]
             print(f"✅ Uploading to folder: {GOOGLE_DRIVE_FOLDER_ID}")
         else:
             print(f"⚠️ No folder ID specified, uploading to root")
-        
+
         print(f"✅ File size: {len(file_data)} bytes")
-        
+
+        # Determine MIME type based on filename extension
+        mimetype = 'video/webm' if filename.endswith('.webm') else 'video/mp4'
+        print(f"✅ Using MIME type: {mimetype}")
+
         # Upload file
         media = MediaIoBaseUpload(
-            io.BytesIO(file_data), 
-            mimetype='video/webm',
+            io.BytesIO(file_data),
+            mimetype=mimetype,
             resumable=True
         )
         print(f"✅ Media upload object created")
@@ -144,6 +165,18 @@ recording_log = []
 # Error logs for debugging
 error_log = []
 
+# Usage Analytics Storage
+usage_analytics = {
+    "recordings_created": [],  # Track each recording creation
+    "video_views": [],  # Track when recordings are watched
+    "video_downloads": [],  # Track when recordings are downloaded
+    "page_visits": {  # Track page visits
+        "recording_page": 0,
+        "admin_dashboard": 0
+    },
+    "started_at": datetime.now().isoformat()
+}
+
 def log_error(message):
     """Add error message to log with timestamp"""
     error_entry = {
@@ -152,10 +185,94 @@ def log_error(message):
     }
     error_log.append(error_entry)
     print(f"❌ LOG: {message}")
-    
+
     # Keep only last 50 errors
     if len(error_log) > 50:
         error_log.pop(0)
+
+def convert_webm_to_mp4(webm_data):
+    """
+    Convert WebM video data to MP4 format using ffmpeg
+    Returns tuple: (mp4_data, error_message)
+    """
+    if not ffmpeg_available:
+        return None, "ffmpeg not available"
+
+    try:
+        print("🔄 Starting WebM to MP4 conversion...")
+
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as webm_file:
+            webm_file.write(webm_data)
+            webm_path = webm_file.name
+
+        mp4_path = webm_path.replace('.webm', '.mp4')
+
+        # Convert using ffmpeg with optimized settings
+        # -y: overwrite output file
+        # -i: input file
+        # -c:v libx264: use H.264 codec for video
+        # -preset fast: encoding speed preset
+        # -crf 23: quality (lower is better, 23 is good default)
+        # -c:a aac: use AAC codec for audio
+        # -b:a 128k: audio bitrate
+        # -movflags +faststart: optimize for streaming
+        command = [
+            'ffmpeg',
+            '-y',
+            '-i', webm_path,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            mp4_path
+        ]
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+
+        if result.returncode != 0:
+            error_msg = f"ffmpeg conversion failed: {result.stderr}"
+            log_error(error_msg)
+            # Clean up temp files
+            try:
+                os.unlink(webm_path)
+                if os.path.exists(mp4_path):
+                    os.unlink(mp4_path)
+            except:
+                pass
+            return None, error_msg
+
+        # Read converted MP4 data
+        with open(mp4_path, 'rb') as mp4_file:
+            mp4_data = mp4_file.read()
+
+        # Clean up temporary files
+        try:
+            os.unlink(webm_path)
+            os.unlink(mp4_path)
+        except Exception as e:
+            log_error(f"Failed to clean up temp files: {e}")
+
+        print(f"✅ Conversion successful: {len(webm_data)} bytes (WebM) -> {len(mp4_data)} bytes (MP4)")
+        return mp4_data, None
+
+    except subprocess.TimeoutExpired:
+        error_msg = "Conversion timeout - video too large or complex"
+        log_error(error_msg)
+        return None, error_msg
+    except Exception as e:
+        error_msg = f"Conversion error: {str(e)}"
+        log_error(error_msg)
+        import traceback
+        traceback.print_exc()
+        return None, error_msg
 
 # Templates
 CUSTOMER_INTERFACE = '''
@@ -516,14 +633,26 @@ CUSTOMER_INTERFACE = '''
                 });
 
                 recordedChunks = [];
-                
-                let mimeType = 'video/webm;codecs=vp9,opus';
+
+                // Try MP4 first, then fall back to WebM
+                let mimeType = 'video/mp4';
+                let fileExtension = 'mp4';
+
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = 'video/webm;codecs=vp9,opus';
+                    fileExtension = 'webm';
+                }
                 if (!MediaRecorder.isTypeSupported(mimeType)) {
                     mimeType = 'video/webm;codecs=vp8,opus';
+                    fileExtension = 'webm';
                 }
                 if (!MediaRecorder.isTypeSupported(mimeType)) {
                     mimeType = 'video/webm';
+                    fileExtension = 'webm';
                 }
+
+                window.recordingMimeType = mimeType;
+                window.recordingFileExtension = fileExtension;
 
                 mediaRecorder = new MediaRecorder(stream, { mimeType });
 
@@ -534,11 +663,11 @@ CUSTOMER_INTERFACE = '''
                 };
 
                 mediaRecorder.onstop = async () => {
-                    const blob = new Blob(recordedChunks, { type: 'video/webm' });
-                    
+                    const blob = new Blob(recordedChunks, { type: window.recordingMimeType });
+
                     // Show loading
                     loadingSection.classList.add('active');
-                    
+
                     // Create video preview
                     const video = document.createElement('video');
                     const localUrl = URL.createObjectURL(blob);
@@ -547,12 +676,12 @@ CUSTOMER_INTERFACE = '''
                     video.className = 'preview-video';
                     video.style.maxWidth = '100%';
                     video.style.height = 'auto';
-                    
+
                     previewArea.innerHTML = '';
                     previewArea.appendChild(video);
 
-                    // Setup local download
-                    const filename = `blueshift-recording-${new Date().getTime()}.webm`;
+                    // Setup local download with correct extension
+                    const filename = `blueshift-recording-${new Date().getTime()}.${window.recordingFileExtension}`;
                     downloadBtn.href = localUrl;
                     downloadBtn.download = filename;
 
@@ -565,7 +694,7 @@ CUSTOMER_INTERFACE = '''
                 });
 
                 mediaRecorder.start(1000);
-                
+
                 recordBtn.disabled = true;
                 stopBtn.disabled = false;
                 recordBtn.innerHTML = '<img src="/blueshift_logo.png" alt="Blueshift" style="height: 16px; width: 16px; vertical-align: middle; margin-right: 4px;"> Recording...';
@@ -575,7 +704,8 @@ CUSTOMER_INTERFACE = '''
                 startTime = Date.now();
                 timerInterval = setInterval(updateTimer, 1000);
 
-                showStatus('<img src="/blueshift_logo.png" alt="Blueshift" style="height: 16px; width: 16px; vertical-align: middle; margin-right: 4px;"> Recording started! Please share your screen and show us the issue.', 'info');
+                const formatMessage = fileExtension === 'mp4' ? 'Recording as MP4' : 'Recording as WebM (MP4 not supported by browser)';
+                showStatus(`<img src="/blueshift_logo.png" alt="Blueshift" style="height: 16px; width: 16px; vertical-align: middle; margin-right: 4px;"> Recording started! ${formatMessage}. Please share your screen and show us the issue.`, 'info');
 
                 setTimeout(() => {
                     if (mediaRecorder && mediaRecorder.state === 'recording') {
@@ -779,6 +909,10 @@ ADMIN_DASHBOARD_TEMPLATE = '''
                 <p>{{ 'Connected' if google_drive_enabled else 'Not Setup' }}</p>
             </div>
             <div class="stat-card">
+                <h3>🎬 MP4 Conversion</h3>
+                <p>{{ 'Enabled' if ffmpeg_enabled else 'Disabled' }}</p>
+            </div>
+            <div class="stat-card">
                 <h3>🔒 Security</h3>
                 <p>Protected</p>
             </div>
@@ -786,8 +920,11 @@ ADMIN_DASHBOARD_TEMPLATE = '''
     </div>
     
     <div class="container">
-        <h2>🔍 Debugging</h2>
-        <p>If Google Drive uploads are failing, check the error logs:</p>
+        <h2>📊 Analytics & Monitoring</h2>
+        <p>Track usage metrics and monitor system health:</p>
+        <a href="/admin/analytics" class="customer-link" style="background: #667eea;">
+            📈 View Usage Analytics
+        </a>
         <a href="/admin/logs" class="customer-link" style="background: #dc3545;">
             📝 View Error Logs
         </a>
@@ -825,6 +962,8 @@ def blueshift_logo():
 
 @app.route('/recording')
 def recording():
+    # Track page visit
+    usage_analytics["page_visits"]["recording_page"] += 1
     return render_template_string(CUSTOMER_INTERFACE)
 
 @app.route('/admin/login', methods=['GET', 'POST'])
@@ -850,15 +989,242 @@ def admin_logout():
 @app.route('/admin')
 @require_auth
 def admin_dashboard():
+    # Track page visit
+    usage_analytics["page_visits"]["admin_dashboard"] += 1
+
     # Check Google Drive configuration
     drive_enabled = bool(GOOGLE_CREDENTIALS_JSON and google_drive_available)
     folder_configured = bool(GOOGLE_DRIVE_FOLDER_ID)
-    
+
     return render_template_string(
         ADMIN_DASHBOARD_TEMPLATE,
         google_drive_enabled=drive_enabled,
-        folder_configured=folder_configured
+        folder_configured=folder_configured,
+        ffmpeg_enabled=ffmpeg_available
     )
+
+@app.route('/admin/analytics')
+@require_auth
+def admin_analytics():
+    """Show usage analytics dashboard"""
+    from collections import Counter
+
+    # Calculate analytics
+    total_recordings = len(usage_analytics["recordings_created"])
+    total_views = len(usage_analytics["video_views"])
+    total_downloads = len(usage_analytics["video_downloads"])
+
+    # Page visit stats
+    recording_page_visits = usage_analytics["page_visits"]["recording_page"]
+    admin_visits = usage_analytics["page_visits"]["admin_dashboard"]
+
+    # Calculate conversion rate (recordings created / page visits)
+    conversion_rate = (total_recordings / recording_page_visits * 100) if recording_page_visits > 0 else 0
+
+    # Get recordings by format
+    formats = [r.get("format", "Unknown") for r in usage_analytics["recordings_created"]]
+    format_counts = Counter(formats)
+
+    # Calculate average file size
+    if total_recordings > 0:
+        total_bytes = sum(r.get("size_bytes", 0) for r in usage_analytics["recordings_created"])
+        avg_size_mb = (total_bytes / total_recordings) / (1024 * 1024)
+    else:
+        avg_size_mb = 0
+
+    # Get most viewed recordings
+    view_counts = Counter(v["recording_id"] for v in usage_analytics["video_views"])
+    most_viewed = view_counts.most_common(10)
+
+    # Recent activity (last 10 recordings)
+    recent_recordings = usage_analytics["recordings_created"][-10:][::-1]  # Last 10, reversed
+
+    # Uptime calculation
+    started_at = datetime.fromisoformat(usage_analytics["started_at"])
+    uptime_seconds = (datetime.now() - started_at).total_seconds()
+    uptime_hours = uptime_seconds / 3600
+    uptime_days = uptime_hours / 24
+
+    analytics_html = f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Analytics Dashboard - Screen Recording Tool</title>
+    <meta charset="utf-8">
+    <meta http-equiv="refresh" content="60">
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; max-width: 1400px; margin: 0 auto; padding: 20px; background: #f5f7fa; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 12px; margin-bottom: 30px; }}
+        .header h1 {{ margin: 0; font-size: 2.5em; }}
+        .header p {{ margin: 10px 0 0 0; opacity: 0.9; }}
+        .back-link {{ color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 10px 20px; border-radius: 6px; display: inline-block; margin-bottom: 20px; }}
+        .back-link:hover {{ background: rgba(255,255,255,0.3); }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+        .stat-card {{ background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-left: 4px solid #667eea; }}
+        .stat-card h3 {{ margin: 0 0 10px 0; color: #667eea; font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .stat-card .value {{ font-size: 2.5em; font-weight: bold; color: #333; margin: 10px 0; }}
+        .stat-card .label {{ color: #666; font-size: 0.9em; }}
+        .stat-card.highlight {{ border-left-color: #28a745; }}
+        .stat-card.highlight h3 {{ color: #28a745; }}
+        .stat-card.warning {{ border-left-color: #ffc107; }}
+        .stat-card.warning h3 {{ color: #ffc107; }}
+        .stat-card.info {{ border-left-color: #17a2b8; }}
+        .stat-card.info h3 {{ color: #17a2b8; }}
+        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin: 20px 0; }}
+        .container h2 {{ margin-top: 0; color: #333; border-bottom: 2px solid #667eea; padding-bottom: 10px; }}
+        .table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+        .table th {{ background: #f8f9fa; padding: 12px; text-align: left; border-bottom: 2px solid #dee2e6; color: #495057; font-weight: 600; }}
+        .table td {{ padding: 12px; border-bottom: 1px solid #dee2e6; }}
+        .table tr:hover {{ background: #f8f9fa; }}
+        .badge {{ display: inline-block; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }}
+        .badge-mp4 {{ background: #d4edda; color: #155724; }}
+        .badge-webm {{ background: #d1ecf1; color: #0c5460; }}
+        .export-btn {{ background: #28a745; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 1em; margin: 10px 5px; }}
+        .export-btn:hover {{ background: #218838; }}
+        .refresh-notice {{ background: #fff3cd; color: #856404; padding: 12px; border-radius: 6px; margin-bottom: 20px; border-left: 4px solid #ffc107; }}
+        .chart-bar {{ background: #667eea; height: 30px; border-radius: 4px; margin: 10px 0; position: relative; }}
+        .chart-bar-label {{ position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: white; font-weight: bold; }}
+        .empty-state {{ text-align: center; padding: 60px 20px; color: #999; }}
+        .empty-state-icon {{ font-size: 4em; margin-bottom: 20px; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <a href="/admin" class="back-link">← Back to Dashboard</a>
+        <h1>📊 Usage Analytics</h1>
+        <p>Blueshift Support Screen Capture Tool - Real-time Usage Statistics</p>
+        <p style="font-size: 0.9em; margin-top: 10px;">Uptime: {uptime_days:.1f} days • Auto-refresh: 60s</p>
+    </div>
+
+    <div class="refresh-notice">
+        🔄 This page auto-refreshes every 60 seconds to show live data
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-card highlight">
+            <h3>📹 Total Recordings</h3>
+            <div class="value">{total_recordings}</div>
+            <div class="label">Recordings created</div>
+        </div>
+
+        <div class="stat-card info">
+            <h3>👁️ Total Views</h3>
+            <div class="value">{total_views}</div>
+            <div class="label">Video views</div>
+        </div>
+
+        <div class="stat-card warning">
+            <h3>📥 Total Downloads</h3>
+            <div class="value">{total_downloads}</div>
+            <div class="label">Video downloads</div>
+        </div>
+
+        <div class="stat-card">
+            <h3>📄 Page Visits</h3>
+            <div class="value">{recording_page_visits}</div>
+            <div class="label">Recording page visits</div>
+        </div>
+
+        <div class="stat-card">
+            <h3>💾 Avg File Size</h3>
+            <div class="value">{avg_size_mb:.1f} MB</div>
+            <div class="label">Per recording</div>
+        </div>
+
+        <div class="stat-card {"highlight" if conversion_rate > 50 else "warning" if conversion_rate > 25 else ""}>
+            <h3>📈 Conversion Rate</h3>
+            <div class="value">{conversion_rate:.1f}%</div>
+            <div class="label">Visitors → Recordings</div>
+        </div>
+    </div>
+
+    <div class="container">
+        <h2>📊 Recording Format Distribution</h2>
+        {_format_chart_html(format_counts, total_recordings)}
+    </div>
+
+    <div class="container">
+        <h2>🔥 Most Viewed Recordings</h2>
+        {_most_viewed_html(most_viewed, recordings_storage)}
+    </div>
+
+    <div class="container">
+        <h2>🕒 Recent Recordings</h2>
+        {_recent_recordings_html(recent_recordings)}
+    </div>
+
+    <div class="container">
+        <h2>📤 Export Data</h2>
+        <p>Download analytics data for external analysis:</p>
+        <a href="/admin/analytics/export" class="export-btn">📊 Export as JSON</a>
+        <a href="/admin/analytics/export?format=csv" class="export-btn" style="background: #17a2b8;">📄 Export as CSV</a>
+    </div>
+</body>
+</html>
+    '''
+
+    def _format_chart_html(format_counts, total):
+        if not format_counts:
+            return '<div class="empty-state"><div class="empty-state-icon">📊</div><p>No recordings yet</p></div>'
+
+        html = '<div style="max-width: 600px;">'
+        for fmt, count in format_counts.most_common():
+            percentage = (count / total * 100) if total > 0 else 0
+            html += f'''
+            <div style="margin: 15px 0;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                    <span><span class="badge badge-{fmt.lower()}">{fmt}</span></span>
+                    <span><strong>{count}</strong> ({percentage:.1f}%)</span>
+                </div>
+                <div style="background: #e9ecef; border-radius: 4px; height: 24px; overflow: hidden;">
+                    <div class="chart-bar" style="width: {percentage}%; height: 100%;"></div>
+                </div>
+            </div>
+            '''
+        html += '</div>'
+        return html
+
+    def _most_viewed_html(most_viewed, storage):
+        if not most_viewed:
+            return '<div class="empty-state"><div class="empty-state-icon">👁️</div><p>No views yet</p></div>'
+
+        html = '<table class="table"><thead><tr><th>Recording ID</th><th>Views</th><th>Created</th><th>Duration</th></tr></thead><tbody>'
+        for recording_id, view_count in most_viewed:
+            recording = storage.get(recording_id, {{}})
+            created = recording.get("created_at", "Unknown")[:19] if recording else "Unknown"
+            duration = recording.get("duration", "N/A") if recording else "N/A"
+            html += f'''
+            <tr>
+                <td><code>{recording_id}</code></td>
+                <td><strong>{view_count}</strong> views</td>
+                <td>{created}</td>
+                <td>{duration}</td>
+            </tr>
+            '''
+        html += '</tbody></table>'
+        return html
+
+    def _recent_recordings_html(recent):
+        if not recent:
+            return '<div class="empty-state"><div class="empty-state-icon">📹</div><p>No recordings yet</p></div>'
+
+        html = '<table class="table"><thead><tr><th>Recording ID</th><th>Created</th><th>Duration</th><th>Size</th><th>Format</th></tr></thead><tbody>'
+        for rec in recent:
+            size_mb = rec.get("size_bytes", 0) / (1024 * 1024)
+            fmt = rec.get("format", "Unknown")
+            html += f'''
+            <tr>
+                <td><code>{rec.get("recording_id", "Unknown")}</code></td>
+                <td>{rec.get("created_at", "Unknown")[:19]}</td>
+                <td>{rec.get("duration", "N/A")}</td>
+                <td>{size_mb:.1f} MB</td>
+                <td><span class="badge badge-{fmt.lower()}">{fmt}</span></td>
+            </tr>
+            '''
+        html += '</tbody></table>'
+        return html
+
+    return analytics_html
 
 @app.route('/admin/logs')
 @require_auth
@@ -916,6 +1282,83 @@ def admin_logs():
     
     return logs_html
 
+@app.route('/admin/analytics/export')
+@require_auth
+def export_analytics():
+    """Export analytics data as JSON or CSV"""
+    export_format = request.args.get('format', 'json').lower()
+
+    if export_format == 'csv':
+        import csv
+        from io import StringIO
+
+        output = StringIO()
+        writer = csv.writer(output)
+
+        # Write recordings CSV
+        writer.writerow(['Type', 'Recording ID', 'Timestamp', 'Duration', 'Size (bytes)', 'Format', 'User Agent'])
+
+        for rec in usage_analytics["recordings_created"]:
+            writer.writerow([
+                'Recording Created',
+                rec.get('recording_id', ''),
+                rec.get('created_at', ''),
+                rec.get('duration', ''),
+                rec.get('size_bytes', 0),
+                rec.get('format', ''),
+                rec.get('user_agent', '')
+            ])
+
+        for view in usage_analytics["video_views"]:
+            writer.writerow([
+                'Video View',
+                view.get('recording_id', ''),
+                view.get('viewed_at', ''),
+                '', '', '',
+                view.get('user_agent', '')
+            ])
+
+        for download in usage_analytics["video_downloads"]:
+            writer.writerow([
+                'Video Download',
+                download.get('recording_id', ''),
+                download.get('downloaded_at', ''),
+                '', '', '',
+                download.get('user_agent', '')
+            ])
+
+        csv_data = output.getvalue()
+        return Response(
+            csv_data,
+            mimetype='text/csv',
+            headers={
+                'Content-Disposition': f'attachment; filename="blueshift-analytics-{datetime.now().strftime("%Y%m%d-%H%M%S")}.csv"'
+            }
+        )
+    else:
+        # JSON export
+        export_data = {
+            "exported_at": datetime.now().isoformat(),
+            "started_tracking": usage_analytics["started_at"],
+            "summary": {
+                "total_recordings": len(usage_analytics["recordings_created"]),
+                "total_views": len(usage_analytics["video_views"]),
+                "total_downloads": len(usage_analytics["video_downloads"]),
+                "page_visits": usage_analytics["page_visits"]
+            },
+            "recordings": usage_analytics["recordings_created"],
+            "views": usage_analytics["video_views"],
+            "downloads": usage_analytics["video_downloads"]
+        }
+
+        return Response(
+            json.dumps(export_data, indent=2),
+            mimetype='application/json',
+            headers={
+                'Content-Disposition': f'attachment; filename="blueshift-analytics-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+            }
+        )
+
 @app.route('/api/store-recording', methods=['POST'])
 def store_recording():
     """Handle recording storage with unique URL generation"""
@@ -932,42 +1375,88 @@ def store_recording():
             print("❌ No recording file provided")
             return jsonify({"error": "No recording file provided"}), 400
         
-        # Generate unique ID and filename
+        # Generate unique ID and use the original filename (which has the correct extension)
         timestamp = int(time.time())
         unique_id = str(uuid.uuid4())[:8]
-        filename = f"blueshift-recording-{timestamp}-{unique_id}.webm"
-        
-        print(f"🔍 Generated filename: {filename}")
+        original_filename = recording_file.filename or f"blueshift-recording-{timestamp}-{unique_id}.webm"
+
+        # Determine content type from filename
+        if original_filename.endswith('.mp4'):
+            content_type = 'video/mp4'
+        elif original_filename.endswith('.webm'):
+            content_type = 'video/webm'
+        else:
+            content_type = 'video/webm'  # default fallback
+
+        print(f"🔍 Original filename: {original_filename}")
+        print(f"🔍 Content type: {content_type}")
         print(f"🔍 Generated ID: {unique_id}")
-        
+
         # Read file data
         file_data = recording_file.read()
         print(f"🔍 File data size: {len(file_data)} bytes")
-        
-        # Store recording in memory (for now)
+
+        # Convert WebM to MP4 if ffmpeg is available
+        final_filename = original_filename
+        final_data = file_data
+        final_content_type = content_type
+
+        if content_type == 'video/webm' and ffmpeg_available:
+            print("🔄 Converting WebM to MP4...")
+            mp4_data, conversion_error = convert_webm_to_mp4(file_data)
+
+            if mp4_data and not conversion_error:
+                # Conversion successful - use MP4
+                final_filename = original_filename.replace('.webm', '.mp4')
+                final_data = mp4_data
+                final_content_type = 'video/mp4'
+                print(f"✅ Using converted MP4 file: {final_filename}")
+            else:
+                # Conversion failed - fall back to original WebM
+                print(f"⚠️  Conversion failed, using original WebM: {conversion_error}")
+                log_error(f"MP4 conversion failed for {unique_id}: {conversion_error}")
+        elif content_type == 'video/webm' and not ffmpeg_available:
+            print("⚠️  ffmpeg not available, storing WebM without conversion")
+
+        # Store recording in memory
         recordings_storage[unique_id] = {
-            "filename": filename,
-            "data": file_data,
+            "filename": final_filename,
+            "data": final_data,
             "duration": duration,
             "created_at": datetime.now().isoformat(),
-            "size_bytes": len(file_data),
-            "content_type": "video/webm"
+            "size_bytes": len(final_data),
+            "content_type": final_content_type
         }
         
         # Log the recording
         recording_entry = {
             "id": unique_id,
-            "filename": filename,
+            "filename": final_filename,
             "duration": duration,
             "stored_at": datetime.now().isoformat(),
-            "size_bytes": len(file_data)
+            "size_bytes": len(final_data),
+            "format": "MP4" if final_content_type == "video/mp4" else "WebM"
         }
-        
+
         recording_log.append(recording_entry)
-        
+
+        # Track recording creation in analytics
+        usage_analytics["recordings_created"].append({
+            "recording_id": unique_id,
+            "created_at": datetime.now().isoformat(),
+            "duration": duration,
+            "size_bytes": len(final_data),
+            "format": "MP4" if final_content_type == "video/mp4" else "WebM",
+            "user_agent": request.headers.get('User-Agent', 'Unknown')
+        })
+
         # Keep only last 100 recordings in memory
         if len(recording_log) > 100:
             recording_log.pop(0)
+
+        # Keep only last 1000 analytics entries
+        if len(usage_analytics["recordings_created"]) > 1000:
+            usage_analytics["recordings_created"].pop(0)
         
         # Generate unique URL
         recording_url = f"{request.url_root}watch/{unique_id}"
@@ -992,6 +1481,18 @@ def store_recording():
 def watch_recording(recording_id):
     """Serve recorded video by unique ID"""
     try:
+        # Track video view in analytics
+        usage_analytics["video_views"].append({
+            "recording_id": recording_id,
+            "viewed_at": datetime.now().isoformat(),
+            "user_agent": request.headers.get('User-Agent', 'Unknown'),
+            "ip_address": request.headers.get('X-Forwarded-For', request.remote_addr)
+        })
+
+        # Keep only last 1000 view entries
+        if len(usage_analytics["video_views"]) > 1000:
+            usage_analytics["video_views"].pop(0)
+
         if recording_id not in recordings_storage:
             return render_template_string('''
 <!DOCTYPE html>
@@ -1101,7 +1602,7 @@ def watch_recording(recording_id):
 
         <div class="video-container">
             <video class="video-player" controls preload="metadata">
-                <source src="/api/video/{{ recording_id }}" type="video/webm">
+                <source src="/api/video/{{ recording_id }}" type="{{ recording.content_type }}">
                 Your browser does not support the video tag.
             </video>
         </div>
@@ -1167,9 +1668,21 @@ def download_recording(recording_id):
     try:
         if recording_id not in recordings_storage:
             return "Recording not found", 404
-        
+
+        # Track download in analytics
+        usage_analytics["video_downloads"].append({
+            "recording_id": recording_id,
+            "downloaded_at": datetime.now().isoformat(),
+            "user_agent": request.headers.get('User-Agent', 'Unknown'),
+            "ip_address": request.headers.get('X-Forwarded-For', request.remote_addr)
+        })
+
+        # Keep only last 1000 download entries
+        if len(usage_analytics["video_downloads"]) > 1000:
+            usage_analytics["video_downloads"].pop(0)
+
         recording = recordings_storage[recording_id]
-        
+
         return Response(
             recording['data'],
             mimetype='application/octet-stream',
@@ -1188,14 +1701,25 @@ def health():
     drive_status = "not_configured"
     if GOOGLE_CREDENTIALS_JSON and google_drive_available:
         drive_status = "configured"
-    
+
+    # Calculate uptime
+    started_at = datetime.fromisoformat(usage_analytics["started_at"])
+    uptime_seconds = (datetime.now() - started_at).total_seconds()
+
     return jsonify({
         "status": "healthy",
         "app": "blueshiftsupport-screen-capture",
-        "version": "2.0-googledrive",
+        "version": "2.1-analytics",
         "recording_available": True,
         "google_drive": drive_status,
-        "total_recordings": len(recording_log)
+        "total_recordings": len(recording_log),
+        "analytics": {
+            "recordings_created": len(usage_analytics["recordings_created"]),
+            "video_views": len(usage_analytics["video_views"]),
+            "video_downloads": len(usage_analytics["video_downloads"]),
+            "page_visits": usage_analytics["page_visits"],
+            "uptime_seconds": int(uptime_seconds)
+        }
     })
 
 @app.route('/api/info')
