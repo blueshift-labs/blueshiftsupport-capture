@@ -1009,6 +1009,68 @@ def admin_analytics():
     """Show usage analytics dashboard"""
     from collections import Counter
 
+    # Helper functions - must be defined BEFORE template
+    def _format_chart_html(format_counts, total):
+        if not format_counts:
+            return '<div class="empty-state"><div class="empty-state-icon">📊</div><p>No recordings yet</p></div>'
+
+        html = '<div style="max-width: 600px;">'
+        for fmt, count in format_counts.most_common():
+            percentage = (count / total * 100) if total > 0 else 0
+            html += f'''
+            <div style="margin: 15px 0;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                    <span><span class="badge badge-{fmt.lower()}">{fmt}</span></span>
+                    <span><strong>{count}</strong> ({percentage:.1f}%)</span>
+                </div>
+                <div style="background: #e9ecef; border-radius: 4px; height: 24px; overflow: hidden;">
+                    <div class="chart-bar" style="width: {percentage}%; height: 100%;"></div>
+                </div>
+            </div>
+            '''
+        html += '</div>'
+        return html
+
+    def _most_viewed_html(most_viewed, storage):
+        if not most_viewed:
+            return '<div class="empty-state"><div class="empty-state-icon">👁️</div><p>No views yet</p></div>'
+
+        html = '<table class="table"><thead><tr><th>Recording ID</th><th>Views</th><th>Created</th><th>Duration</th></tr></thead><tbody>'
+        for recording_id, view_count in most_viewed:
+            recording = storage.get(recording_id, {})
+            created = recording.get("created_at", "Unknown")[:19] if recording else "Unknown"
+            duration = recording.get("duration", "N/A") if recording else "N/A"
+            html += f'''
+            <tr>
+                <td><code>{recording_id}</code></td>
+                <td><strong>{view_count}</strong> views</td>
+                <td>{created}</td>
+                <td>{duration}</td>
+            </tr>
+            '''
+        html += '</tbody></table>'
+        return html
+
+    def _recent_recordings_html(recent):
+        if not recent:
+            return '<div class="empty-state"><div class="empty-state-icon">📹</div><p>No recordings yet</p></div>'
+
+        html = '<table class="table"><thead><tr><th>Recording ID</th><th>Created</th><th>Duration</th><th>Size</th><th>Format</th></tr></thead><tbody>'
+        for rec in recent:
+            size_mb = rec.get("size_bytes", 0) / (1024 * 1024)
+            fmt = rec.get("format", "Unknown")
+            html += f'''
+            <tr>
+                <td><code>{rec.get("recording_id", "Unknown")}</code></td>
+                <td>{rec.get("created_at", "Unknown")[:19]}</td>
+                <td>{rec.get("duration", "N/A")}</td>
+                <td>{size_mb:.1f} MB</td>
+                <td><span class="badge badge-{fmt.lower()}">{fmt}</span></td>
+            </tr>
+            '''
+        html += '</tbody></table>'
+        return html
+
     # Calculate analytics
     total_recordings = len(usage_analytics["recordings_created"])
     total_views = len(usage_analytics["video_views"])
@@ -1044,6 +1106,11 @@ def admin_analytics():
     uptime_seconds = (datetime.now() - started_at).total_seconds()
     uptime_hours = uptime_seconds / 3600
     uptime_days = uptime_hours / 24
+
+    # Build HTML sections using helper functions
+    format_chart_section = _format_chart_html(format_counts, total_recordings)
+    most_viewed_section = _most_viewed_html(most_viewed, recordings_storage)
+    recent_recordings_section = _recent_recordings_html(recent_recordings)
 
     analytics_html = f'''
 <!DOCTYPE html>
@@ -1140,17 +1207,17 @@ def admin_analytics():
 
     <div class="container">
         <h2>📊 Recording Format Distribution</h2>
-        {_format_chart_html(format_counts, total_recordings)}
+        {format_chart_section}
     </div>
 
     <div class="container">
         <h2>🔥 Most Viewed Recordings</h2>
-        {_most_viewed_html(most_viewed, recordings_storage)}
+        {most_viewed_section}
     </div>
 
     <div class="container">
         <h2>🕒 Recent Recordings</h2>
-        {_recent_recordings_html(recent_recordings)}
+        {recent_recordings_section}
     </div>
 
     <div class="container">
@@ -1162,67 +1229,6 @@ def admin_analytics():
 </body>
 </html>
     '''
-
-    def _format_chart_html(format_counts, total):
-        if not format_counts:
-            return '<div class="empty-state"><div class="empty-state-icon">📊</div><p>No recordings yet</p></div>'
-
-        html = '<div style="max-width: 600px;">'
-        for fmt, count in format_counts.most_common():
-            percentage = (count / total * 100) if total > 0 else 0
-            html += f'''
-            <div style="margin: 15px 0;">
-                <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
-                    <span><span class="badge badge-{fmt.lower()}">{fmt}</span></span>
-                    <span><strong>{count}</strong> ({percentage:.1f}%)</span>
-                </div>
-                <div style="background: #e9ecef; border-radius: 4px; height: 24px; overflow: hidden;">
-                    <div class="chart-bar" style="width: {percentage}%; height: 100%;"></div>
-                </div>
-            </div>
-            '''
-        html += '</div>'
-        return html
-
-    def _most_viewed_html(most_viewed, storage):
-        if not most_viewed:
-            return '<div class="empty-state"><div class="empty-state-icon">👁️</div><p>No views yet</p></div>'
-
-        html = '<table class="table"><thead><tr><th>Recording ID</th><th>Views</th><th>Created</th><th>Duration</th></tr></thead><tbody>'
-        for recording_id, view_count in most_viewed:
-            recording = storage.get(recording_id, {{}})
-            created = recording.get("created_at", "Unknown")[:19] if recording else "Unknown"
-            duration = recording.get("duration", "N/A") if recording else "N/A"
-            html += f'''
-            <tr>
-                <td><code>{recording_id}</code></td>
-                <td><strong>{view_count}</strong> views</td>
-                <td>{created}</td>
-                <td>{duration}</td>
-            </tr>
-            '''
-        html += '</tbody></table>'
-        return html
-
-    def _recent_recordings_html(recent):
-        if not recent:
-            return '<div class="empty-state"><div class="empty-state-icon">📹</div><p>No recordings yet</p></div>'
-
-        html = '<table class="table"><thead><tr><th>Recording ID</th><th>Created</th><th>Duration</th><th>Size</th><th>Format</th></tr></thead><tbody>'
-        for rec in recent:
-            size_mb = rec.get("size_bytes", 0) / (1024 * 1024)
-            fmt = rec.get("format", "Unknown")
-            html += f'''
-            <tr>
-                <td><code>{rec.get("recording_id", "Unknown")}</code></td>
-                <td>{rec.get("created_at", "Unknown")[:19]}</td>
-                <td>{rec.get("duration", "N/A")}</td>
-                <td>{size_mb:.1f} MB</td>
-                <td><span class="badge badge-{fmt.lower()}">{fmt}</span></td>
-            </tr>
-            '''
-        html += '</tbody></table>'
-        return html
 
     return analytics_html
 
